@@ -1,0 +1,1012 @@
+' ============================================================
+' Auto RFI Narration Generator
+' Version  : 18.0.0
+' Updated  : 2026-03-27
+' Changes in v18.0:
+'   1. Case ID is NEVER auto-filled; always left blank ([BLANK]) for manual entry.
+'   2. Subject line format: RFI - CASE ID - [BLANK] - CIF ID - XXXX - NAME - Banking - T30
+'   3. Attachment section removed entirely from MakeEmail.
+'   4. Repeated wording in Q3/Q4 (inward/outward transfer questions) removed.
+'   5. Common requirement text is no longer repeated under every question.
+'   6. A single consolidated note is added after all per-counterparty questions.
+'   7. Branch Details section added at the bottom of both Word narration and email.
+'   8. Branch lookup uses first 3 digits of account number against "Updated Branch List" Excel.
+'   9. Placeholder output when branch lookup file is not found or no match is found.
+' ============================================================
+
+Option Explicit
+
+' ============================================================
+' CONSTANTS
+' ============================================================
+Private Const APP_VERSION As String = "18.0.0"
+Private Const TEMPLATE_SUBFOLDER As String = "RFI Templates"
+Private Const BRANCH_LIST_NAME   As String = "Updated Branch List"
+
+' ============================================================
+' TYPE DEFINITIONS
+' ============================================================
+Private Type ParsedInfo
+    CaseID      As String   ' Always "" — filled manually (v18: never auto-set)
+    AlertID     As String
+    CifID       As String
+    CustName    As String
+    AcctNo      As String
+    BankProduct As String
+    TenorCode   As String
+    RFIDate     As String
+    DocPath     As String
+    TemplatePath As String
+End Type
+
+Private Type TransactionItem
+    TxnDate       As String
+    ValueDate     As String
+    Amount        As Double
+    Currency      As String
+    Direction     As String   ' "Inward" or "Outward"
+    Counterparty  As String
+    BankName      As String
+    Country       As String
+    Reference     As String
+    Narration     As String
+End Type
+
+' ============================================================
+' MAIN ENTRY POINT
+' ============================================================
+Public Sub RunRFIGenerator()
+    Dim p As ParsedInfo
+    Dim txns() As TransactionItem
+    Dim txnCount As Long
+
+    ' --- 1. Identify source document -----------------------
+    Dim docPath As String
+    docPath = GetSourceDocPath()
+    If docPath = "" Then
+        MsgBox "No source document selected. Aborting.", vbExclamation, "RFI Generator v" & APP_VERSION
+        Exit Sub
+    End If
+    p.DocPath = docPath
+
+    ' --- 2. Locate RFI template ----------------------------
+    p.TemplatePath = FindTemplateFile(docPath)
+
+    ' --- 3. Parse the source document ----------------------
+    If Not ParseDoc(docPath, p) Then
+        MsgBox "Failed to parse source document: " & docPath, vbCritical, "RFI Generator v" & APP_VERSION
+        Exit Sub
+    End If
+
+    ' --- 4. Load transactions from Excel -------------------
+    txnCount = LoadTransactions(docPath, txns)
+
+    ' --- 5. Build Word narration ---------------------------
+    Dim narrationPath As String
+    narrationPath = BuildNarration(p, txns, txnCount)
+
+    ' --- 6. Build Outlook email ----------------------------
+    MakeEmail p, txns, txnCount
+
+    ' --- 7. Log the action ---------------------------------
+    LogActivity p, narrationPath
+
+    MsgBox "RFI Generation complete (v" & APP_VERSION & ")." & vbCrLf & _
+           "Narration saved to: " & narrationPath, vbInformation, "RFI Generator"
+End Sub
+
+' ============================================================
+' FILE / PATH HELPERS
+' ============================================================
+Private Function GetSourceDocPath() As String
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "Select RFI Source Document"
+        .Filters.Clear
+        .Filters.Add "Word / Excel", "*.docx;*.doc;*.xlsx;*.xls"
+        .AllowMultiSelect = False
+        If .Show = -1 Then
+            GetSourceDocPath = .SelectedItems(1)
+        End If
+    End With
+End Function
+
+Private Function FindTemplateFile(sourcePath As String) As String
+    Dim baseFolder As String
+    baseFolder = Left(sourcePath, InStrRev(sourcePath, Application.PathSeparator))
+
+    Dim candidate As String
+    ' Search current folder and one level up
+    candidate = baseFolder & TEMPLATE_SUBFOLDER & Application.PathSeparator & "RFI_Template.docx"
+    If Dir(candidate) <> "" Then FindTemplateFile = candidate : Exit Function
+
+    candidate = baseFolder & "RFI_Template.docx"
+    If Dir(candidate) <> "" Then FindTemplateFile = candidate : Exit Function
+
+    FindTemplateFile = ""
+End Function
+
+' ============================================================
+' DOCUMENT PARSER
+' v18: CaseID is NEVER set from AlertID or any regex match.
+'      p.CaseID is always left as "" for manual entry.
+' ============================================================
+Private Function ParseDoc(docPath As String, ByRef p As ParsedInfo) As Boolean
+    On Error GoTo ErrHandler
+
+    ' Open Word document for reading
+    Dim wdApp As Object
+    Dim wdDoc As Object
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+    Set wdDoc = wdApp.Documents.Open(Filename:=docPath, ReadOnly:=True)
+
+    Dim fullText As String
+    fullText = wdDoc.Content.Text
+
+    ' --- Extract AlertID (for reference only — NOT used for CaseID) ---
+    p.AlertID = ExtractField(fullText, "Alert ID", "Alert No", "AlertID")
+
+    ' --- v18: CaseID is ALWAYS blank — manual entry required ---
+    p.CaseID = ""
+
+    ' --- Extract other fields ---
+    p.CifID       = ExtractField(fullText, "CIF ID", "CIF No", "Customer ID")
+    p.CustName    = ExtractField(fullText, "Customer Name", "Name", "Account Holder")
+    p.AcctNo      = ExtractField(fullText, "Account Number", "Account No", "Acct No")
+    p.BankProduct = ExtractField(fullText, "Product", "Bank Product", "Account Type")
+    p.TenorCode   = ExtractField(fullText, "Tenor", "T-Code", "Tenor Code")
+    p.RFIDate     = Format(Now(), "DD-MMM-YYYY")
+
+    ' Cleanup
+    wdDoc.Close SaveChanges:=False
+    wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+
+    ParseDoc = True
+    Exit Function
+
+ErrHandler:
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    ParseDoc = False
+End Function
+
+' ============================================================
+' FIELD EXTRACTOR  (tries multiple label variants)
+' ============================================================
+Private Function ExtractField(fullText As String, ParamArray labels() As Variant) As String
+    Dim lbl As Variant
+    Dim pos As Long
+    Dim lineEnd As Long
+    Dim raw As String
+
+    For Each lbl In labels
+        pos = InStr(1, fullText, CStr(lbl), vbTextCompare)
+        If pos > 0 Then
+            ' Advance past the label and any separator characters
+            pos = pos + Len(CStr(lbl))
+            Do While pos <= Len(fullText) And (Mid(fullText, pos, 1) = ":" Or Mid(fullText, pos, 1) = " " Or Mid(fullText, pos, 1) = Chr(9))
+                pos = pos + 1
+            Loop
+            lineEnd = InStr(pos, fullText, Chr(13))
+            If lineEnd = 0 Then lineEnd = InStr(pos, fullText, Chr(10))
+            If lineEnd = 0 Then lineEnd = Len(fullText) + 1
+            raw = Trim(Mid(fullText, pos, lineEnd - pos))
+            If raw <> "" Then
+                ExtractField = raw
+                Exit Function
+            End If
+        End If
+    Next lbl
+
+    ExtractField = ""
+End Function
+
+' ============================================================
+' TRANSACTION LOADER
+' ============================================================
+Private Function LoadTransactions(sourcePath As String, ByRef txns() As TransactionItem) As Long
+    On Error GoTo ErrHandler
+
+    Dim xlApp As Object
+    Dim xlWb  As Object
+    Dim xlWs  As Object
+
+    Set xlApp = CreateObject("Excel.Application")
+    xlApp.Visible = False
+
+    ' Derive Excel transaction file path (same base name, .xlsx extension)
+    Dim xlPath As String
+    Dim dotPos As Long
+    dotPos = InStrRev(sourcePath, ".")
+    If dotPos > 0 Then
+        xlPath = Left(sourcePath, dotPos - 1) & "_transactions.xlsx"
+    Else
+        xlPath = sourcePath & "_transactions.xlsx"
+    End If
+
+    If Dir(xlPath) = "" Then
+        ' Try same folder with generic name
+        Dim baseFolder As String
+        baseFolder = Left(sourcePath, InStrRev(sourcePath, Application.PathSeparator))
+        xlPath = baseFolder & "transactions.xlsx"
+    End If
+
+    If Dir(xlPath) = "" Then
+        LoadTransactions = 0
+        GoTo Cleanup
+    End If
+
+    Set xlWb = xlApp.Workbooks.Open(Filename:=xlPath, ReadOnly:=True)
+    Set xlWs = xlWb.Sheets(1)
+
+    Dim lastRow As Long
+    lastRow = xlWs.Cells(xlWs.Rows.Count, 1).End(-4162).Row  ' xlUp = -4162
+
+    ' Find header row
+    Dim headerRow As Long
+    headerRow = 1
+    Dim r As Long
+    For r = 1 To 5
+        If InStr(1, CStr(xlWs.Cells(r, 1).Value), "Date", vbTextCompare) > 0 Then
+            headerRow = r
+            Exit For
+        End If
+    Next r
+
+    Dim colDate As Integer, colValDate As Integer, colAmt As Integer
+    Dim colCcy As Integer, colDir As Integer, colCpty As Integer
+    Dim colBank As Integer, colCtry As Integer, colRef As Integer, colNarr As Integer
+
+    ' Map columns by header names
+    Dim c As Integer
+    For c = 1 To 15
+        Dim hdr As String
+        hdr = Trim(CStr(xlWs.Cells(headerRow, c).Value))
+        Select Case True
+            Case InStr(1, hdr, "Transaction Date", vbTextCompare) > 0 : colDate    = c
+            Case InStr(1, hdr, "Value Date",       vbTextCompare) > 0 : colValDate = c
+            Case InStr(1, hdr, "Amount",           vbTextCompare) > 0 : colAmt     = c
+            Case InStr(1, hdr, "Currency",         vbTextCompare) > 0 : colCcy     = c
+            Case InStr(1, hdr, "Direction",        vbTextCompare) > 0 : colDir     = c
+            Case InStr(1, hdr, "Counterparty",     vbTextCompare) > 0 : colCpty    = c
+            Case InStr(1, hdr, "Bank",             vbTextCompare) > 0 : colBank    = c
+            Case InStr(1, hdr, "Country",          vbTextCompare) > 0 : colCtry    = c
+            Case InStr(1, hdr, "Reference",        vbTextCompare) > 0 : colRef     = c
+            Case InStr(1, hdr, "Narration",        vbTextCompare) > 0 : colNarr    = c
+        End Select
+    Next c
+
+    Dim dataRows As Long
+    dataRows = lastRow - headerRow
+    If dataRows <= 0 Then GoTo Cleanup
+
+    ReDim txns(1 To dataRows)
+    Dim idx As Long : idx = 0
+
+    For r = headerRow + 1 To lastRow
+        Dim amtVal As Double
+        On Error Resume Next
+        amtVal = CDbl(xlWs.Cells(r, colAmt).Value)
+        On Error GoTo ErrHandler
+        If amtVal = 0 And colAmt > 0 Then
+            If Trim(CStr(xlWs.Cells(r, colAmt).Value)) = "" Then GoTo NextRow
+        End If
+
+        idx = idx + 1
+        With txns(idx)
+            .TxnDate      = SafeStr(xlWs.Cells(r, colDate).Value)
+            .ValueDate    = SafeStr(xlWs.Cells(r, colValDate).Value)
+            .Amount       = amtVal
+            .Currency     = SafeStr(xlWs.Cells(r, colCcy).Value)
+            .Direction    = SafeStr(xlWs.Cells(r, colDir).Value)
+            .Counterparty = SafeStr(xlWs.Cells(r, colCpty).Value)
+            .BankName     = SafeStr(xlWs.Cells(r, colBank).Value)
+            .Country      = SafeStr(xlWs.Cells(r, colCtry).Value)
+            .Reference    = SafeStr(xlWs.Cells(r, colRef).Value)
+            .Narration    = SafeStr(xlWs.Cells(r, colNarr).Value)
+        End With
+NextRow:
+    Next r
+
+    LoadTransactions = idx
+
+Cleanup:
+    On Error Resume Next
+    If Not xlWb Is Nothing Then xlWb.Close SaveChanges:=False
+    xlApp.Quit
+    Set xlWs = Nothing
+    Set xlWb = Nothing
+    Set xlApp = Nothing
+    Exit Function
+
+ErrHandler:
+    Resume Cleanup
+End Function
+
+Private Function SafeStr(v As Variant) As String
+    On Error Resume Next
+    If IsDate(v) Then
+        SafeStr = Format(CDate(v), "DD-MMM-YYYY")
+    ElseIf IsNumeric(v) Then
+        SafeStr = CStr(v)
+    Else
+        SafeStr = Trim(CStr(v))
+    End If
+End Function
+
+' ============================================================
+' COMPUTATION ENGINE
+' Groups transactions by direction and counterparty,
+' computes totals for use in Q3/Q4 question engine.
+' ============================================================
+Private Sub ComputeTransactionGroups( _
+        txns() As TransactionItem, txnCount As Long, _
+        ByRef inwardGroups() As String, ByRef inwardAmts() As Double, ByRef inwardCount As Long, _
+        ByRef outwardGroups() As String, ByRef outwardAmts() As Double, ByRef outwardCount As Long)
+
+    ReDim inwardGroups(1 To 50)
+    ReDim inwardAmts(1 To 50)
+    ReDim outwardGroups(1 To 50)
+    ReDim outwardAmts(1 To 50)
+    inwardCount = 0
+    outwardCount = 0
+
+    If txnCount = 0 Then Exit Sub
+
+    Dim i As Long
+    For i = 1 To txnCount
+        Dim cpty As String
+        cpty = txns(i).Counterparty
+        If cpty = "" Then cpty = "(Unknown)"
+
+        Dim dir As String
+        dir = UCase(Trim(txns(i).Direction))
+
+        If dir = "INWARD" Or dir = "CR" Or dir = "CREDIT" Or dir = "IN" Then
+            ' Add to inward group
+            Dim j As Long
+            Dim found As Boolean : found = False
+            For j = 1 To inwardCount
+                If inwardGroups(j) = cpty Then
+                    inwardAmts(j) = inwardAmts(j) + txns(i).Amount
+                    found = True
+                    Exit For
+                End If
+            Next j
+            If Not found Then
+                inwardCount = inwardCount + 1
+                inwardGroups(inwardCount) = cpty
+                inwardAmts(inwardCount) = txns(i).Amount
+            End If
+        Else
+            ' Add to outward group
+            Dim k As Long
+            Dim found2 As Boolean : found2 = False
+            For k = 1 To outwardCount
+                If outwardGroups(k) = cpty Then
+                    outwardAmts(k) = outwardAmts(k) + txns(i).Amount
+                    found2 = True
+                    Exit For
+                End If
+            Next k
+            If Not found2 Then
+                outwardCount = outwardCount + 1
+                outwardGroups(outwardCount) = cpty
+                outwardAmts(outwardCount) = txns(i).Amount
+            End If
+        End If
+    Next i
+End Sub
+
+' ============================================================
+' BRANCH LOOKUP
+' v18: Uses first 3 digits of AcctNo.
+'      Searches for "Updated Branch List" Excel in the same
+'      folder hierarchy as the source document / template.
+'      Column C = Branch Code to match.
+' ============================================================
+Private Function LookupBranch(p As ParsedInfo) As String
+    On Error GoTo NotFound
+
+    If Len(p.AcctNo) < 3 Then GoTo NotFound
+
+    Dim branchPrefix As String
+    branchPrefix = Left(p.AcctNo, 3)
+
+    ' Locate the "Updated Branch List" Excel file
+    Dim baseFolder As String
+    baseFolder = Left(p.DocPath, InStrRev(p.DocPath, Application.PathSeparator))
+
+    Dim branchFilePath As String
+    branchFilePath = FindBranchListFile(baseFolder)
+
+    If branchFilePath = "" Then
+        LookupBranch = "Branch Details: [Please update manually -- " & _
+                       "branch lookup file not found or no match for account prefix """ & branchPrefix & """]"
+        Exit Function
+    End If
+
+    ' Open the branch list Excel
+    Dim xlApp As Object
+    Dim xlWb  As Object
+    Dim xlWs  As Object
+
+    Set xlApp = CreateObject("Excel.Application")
+    xlApp.Visible = False
+    Set xlWb = xlApp.Workbooks.Open(Filename:=branchFilePath, ReadOnly:=True)
+    Set xlWs = xlWb.Sheets(1)
+
+    Dim lastRow As Long
+    lastRow = xlWs.Cells(xlWs.Rows.Count, 3).End(-4162).Row  ' Column C
+
+    Dim r As Long
+    Dim result As String
+    result = ""
+
+    For r = 2 To lastRow   ' Skip header row (row 1)
+        Dim cellVal As String
+        cellVal = Trim(CStr(xlWs.Cells(r, 3).Value))  ' Column C = Branch Code
+        If cellVal = branchPrefix Then
+            ' Build full row details
+            Dim branchCode As String : branchCode = cellVal
+            Dim branchName As String : branchName = Trim(CStr(xlWs.Cells(r, 2).Value))
+            Dim branchDetails As String : branchDetails = ""
+
+            ' Collect all non-empty columns for the matching row
+            Dim c As Integer
+            Dim rowDetails As String : rowDetails = ""
+            For c = 1 To 10
+                Dim cv As String
+                cv = Trim(CStr(xlWs.Cells(r, c).Value))
+                If cv <> "" Then
+                    If rowDetails <> "" Then rowDetails = rowDetails & " | "
+                    rowDetails = rowDetails & cv
+                End If
+            Next c
+
+            result = "Branch Code: " & branchCode & _
+                     "  |  Branch Name: " & branchName & _
+                     "  |  Full Details: " & rowDetails
+            Exit For
+        End If
+    Next r
+
+    xlWb.Close SaveChanges:=False
+    xlApp.Quit
+    Set xlWs = Nothing
+    Set xlWb = Nothing
+    Set xlApp = Nothing
+
+    If result = "" Then
+        LookupBranch = "Branch Details: [Please update manually -- " & _
+                       "no matching branch found for account prefix """ & branchPrefix & """]"
+    Else
+        LookupBranch = result
+    End If
+    Exit Function
+
+NotFound:
+    On Error Resume Next
+    If Not xlWb Is Nothing Then xlWb.Close SaveChanges:=False
+    If Not xlApp Is Nothing Then xlApp.Quit
+    LookupBranch = "Branch Details: [Please update manually -- " & _
+                   "branch lookup file not found or no match for account prefix """ & _
+                   IIf(Len(p.AcctNo) >= 3, Left(p.AcctNo, 3), p.AcctNo) & """]"
+End Function
+
+Private Function FindBranchListFile(baseFolder As String) As String
+    Dim candidate As String
+
+    ' Try exact match in several common locations
+    Dim locations(4) As String
+    locations(0) = baseFolder
+    locations(1) = baseFolder & TEMPLATE_SUBFOLDER & Application.PathSeparator
+    locations(2) = Left(baseFolder, InStrRev(baseFolder, Application.PathSeparator, Len(baseFolder) - 1))
+    locations(3) = locations(2) & TEMPLATE_SUBFOLDER & Application.PathSeparator
+
+    Dim exts(1) As String
+    exts(0) = ".xlsx"
+    exts(1) = ".xls"
+
+    Dim i As Integer, e As Integer
+    For i = 0 To 3
+        For e = 0 To 1
+            candidate = locations(i) & BRANCH_LIST_NAME & exts(e)
+            If Dir(candidate) <> "" Then
+                FindBranchListFile = candidate
+                Exit Function
+            End If
+        Next e
+    Next i
+
+    FindBranchListFile = ""
+End Function
+
+' ============================================================
+' BUILD NARRATION  (Word document)
+' v18: Case ID = [BLANK], Branch Details added at bottom,
+'      no repeated wording in Q3/Q4.
+' ============================================================
+Private Function BuildNarration(p As ParsedInfo, txns() As TransactionItem, txnCount As Long) As String
+    On Error GoTo ErrHandler
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim wdSel As Object
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+
+    ' Open template or create blank document
+    If p.TemplatePath <> "" And Dir(p.TemplatePath) <> "" Then
+        Set wdDoc = wdApp.Documents.Open(Filename:=p.TemplatePath)
+    Else
+        Set wdDoc = wdApp.Documents.Add
+    End If
+
+    Set wdSel = wdApp.Selection
+    wdSel.HomeKey Unit:=6  ' wdStory = 6
+
+    ' ---- HEADER BLOCK ----------------------------------------
+    AppendLine wdSel, "AUTO RFI NARRATION GENERATOR  v" & APP_VERSION
+    AppendLine wdSel, String(60, "-")
+    AppendLine wdSel, "Date         : " & p.RFIDate
+    AppendLine wdSel, "Case ID      : [BLANK]  (please fill manually)"
+    AppendLine wdSel, "Alert ID     : " & p.AlertID
+    AppendLine wdSel, "CIF ID       : " & p.CifID
+    AppendLine wdSel, "Customer     : " & p.CustName
+    AppendLine wdSel, "Account No   : " & p.AcctNo
+    AppendLine wdSel, "Product      : " & p.BankProduct
+    AppendLine wdSel, "Tenor        : " & p.TenorCode
+    AppendLine wdSel, String(60, "-")
+    AppendLine wdSel, ""
+
+    ' ---- RFI QUERIES SECTION ---------------------------------
+    AppendLine wdSel, "RFI QUERIES"
+    AppendLine wdSel, String(40, "-")
+    AppendLine wdSel, ""
+
+    Dim inwardGroups()  As String
+    Dim inwardAmts()    As Double
+    Dim inwardCount     As Long
+    Dim outwardGroups() As String
+    Dim outwardAmts()   As Double
+    Dim outwardCount    As Long
+
+    ComputeTransactionGroups txns, txnCount, _
+        inwardGroups, inwardAmts, inwardCount, _
+        outwardGroups, outwardAmts, outwardCount
+
+    Dim qNum As Integer : qNum = 1
+
+    ' Q1 — KYC / Purpose of Account
+    AppendLine wdSel, qNum & ". Please provide the purpose of maintaining the above-mentioned bank account."
+    qNum = qNum + 1
+    AppendLine wdSel, ""
+
+    ' Q2 — Source of Funds
+    AppendLine wdSel, qNum & ". Please provide details on the source of funds credited to the account."
+    qNum = qNum + 1
+    AppendLine wdSel, ""
+
+    ' Q3 — Inward Transfers (one observation per counterparty, NO repeated request text)
+    If inwardCount > 0 Then
+        Dim i As Long
+        For i = 1 To inwardCount
+            AppendLine wdSel, qNum & ". Inward transfer of " & _
+                FormatAmount(inwardAmts(i)) & " was received from " & inwardGroups(i) & "."
+            qNum = qNum + 1
+            AppendLine wdSel, ""
+        Next i
+
+        ' v18: ONE consolidated note after all inward questions
+        AppendLine wdSel, "Note: For all the above transaction queries, kindly provide the purpose and " & _
+                          "nature of the transactions along with the supporting documents."
+        AppendLine wdSel, ""
+    End If
+
+    ' Q4 — Outward Transfers (one observation per counterparty, NO repeated request text)
+    If outwardCount > 0 Then
+        Dim j As Long
+        For j = 1 To outwardCount
+            AppendLine wdSel, qNum & ". Outward transfer of " & _
+                FormatAmount(outwardAmts(j)) & " was made to " & outwardGroups(j) & "."
+            qNum = qNum + 1
+            AppendLine wdSel, ""
+        Next j
+
+        ' v18: ONE consolidated note after all outward questions (if not already shown)
+        If inwardCount = 0 Then
+            AppendLine wdSel, "Note: For all the above transaction queries, kindly provide the purpose and " & _
+                              "nature of the transactions along with the supporting documents."
+            AppendLine wdSel, ""
+        End If
+    End If
+
+    ' Q5 — General documentation request (only if no transactions triggered the note)
+    If inwardCount = 0 And outwardCount = 0 Then
+        AppendLine wdSel, qNum & ". Please provide the purpose and nature of the transactions along with " & _
+                          "the supporting documents."
+        qNum = qNum + 1
+        AppendLine wdSel, ""
+    End If
+
+    ' ---- BRANCH DETAILS SECTION (v18 new) --------------------
+    AppendLine wdSel, String(40, "-")
+    AppendLine wdSel, "BRANCH DETAILS"
+    AppendLine wdSel, String(40, "-")
+    AppendLine wdSel, LookupBranch(p)
+    AppendLine wdSel, ""
+
+    ' ---- FOOTER ----------------------------------------------
+    AppendLine wdSel, String(60, "-")
+    AppendLine wdSel, "Generated by Auto RFI Narration Generator v" & APP_VERSION
+
+    ' ---- SAVE ------------------------------------------------
+    Dim savePath As String
+    Dim baseFolder As String
+    baseFolder = Left(p.DocPath, InStrRev(p.DocPath, Application.PathSeparator))
+    savePath = baseFolder & "RFI_Narration_" & p.CifID & "_" & Format(Now(), "YYYYMMDD_HHMMSS") & ".docx"
+
+    wdDoc.SaveAs2 Filename:=savePath, FileFormat:=16  ' wdFormatDocumentDefault
+    wdDoc.Close
+    wdApp.Quit
+    Set wdSel = Nothing
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+
+    BuildNarration = savePath
+    Exit Function
+
+ErrHandler:
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    BuildNarration = ""
+End Function
+
+Private Sub AppendLine(sel As Object, txt As String)
+    sel.EndKey Unit:=6   ' wdStory
+    sel.TypeText txt & Chr(13)
+End Sub
+
+Private Function FormatAmount(amt As Double) As String
+    FormatAmount = Format(amt, "#,##0.00")
+End Function
+
+' ============================================================
+' MAKE EMAIL  (Outlook)
+' v18: Subject uses [BLANK] for Case ID.
+'      NO attachments.
+'      NO repeated wording per Q3/Q4 question.
+'      ONE consolidated note after transaction observations.
+'      Branch Details section at the bottom.
+' ============================================================
+Public Sub MakeEmail(p As ParsedInfo, txns() As TransactionItem, txnCount As Long)
+    On Error GoTo ErrHandler
+
+    Dim olApp  As Object
+    Dim olMail As Object
+
+    Set olApp  = CreateObject("Outlook.Application")
+    Set olMail = olApp.CreateItem(0)  ' olMailItem = 0
+
+    ' ---- SUBJECT — v18: Case ID is always [BLANK] -----------
+    ' Format: RFI - CASE ID - [BLANK] - CIF ID - XXXX - NAME - Banking - T30
+    Dim subject As String
+    subject = "RFI - CASE ID - [BLANK] - CIF ID - " & p.CifID & _
+              " - " & p.CustName & " - " & p.BankProduct & " - " & p.TenorCode
+
+    olMail.Subject = subject
+
+    ' ---- BUILD HTML BODY ------------------------------------
+    Dim html As String
+    html = BuildEmailHTML(p, txns, txnCount)
+    olMail.HTMLBody = html
+
+    ' v18: NO attachments — attachment section removed entirely.
+    ' (No .docx narration or .xlsx transaction file is attached.)
+
+    olMail.Display   ' Show email for review before sending
+
+    Set olMail = Nothing
+    Set olApp  = Nothing
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    Set olMail = Nothing
+    Set olApp  = Nothing
+    MsgBox "Failed to create email: " & Err.Description, vbCritical, "RFI Generator v" & APP_VERSION
+End Sub
+
+' ============================================================
+' BUILD EMAIL HTML BODY
+' v18: No attachment mentions, no repeated per-question text,
+'      common note once, Branch Details at the bottom.
+' ============================================================
+Private Function BuildEmailHTML(p As ParsedInfo, txns() As TransactionItem, txnCount As Long) As String
+    Dim h As String
+
+    h = "<!DOCTYPE html><html><body style=""font-family:Calibri,Arial,sans-serif;font-size:11pt;"">"
+    h = h & "<p>Dear Sir/Madam,</p>"
+    h = h & "<p>Greetings!</p>"
+    h = h & "<p>We are writing to request certain information and documentation regarding the above-mentioned "
+    h = h & "customer account. Kindly provide the following details at your earliest convenience.</p>"
+
+    ' ---- Customer Reference Details -------------------------
+    h = h & "<table border=""1"" cellpadding=""5"" cellspacing=""0"" style=""border-collapse:collapse;"">"
+    h = h & "<tr><th>Field</th><th>Details</th></tr>"
+    h = h & "<tr><td>Case ID</td><td><strong>[BLANK]</strong> (to be filled manually)</td></tr>"
+    h = h & "<tr><td>Alert ID</td><td>" & HE(p.AlertID) & "</td></tr>"
+    h = h & "<tr><td>CIF ID</td><td>" & HE(p.CifID) & "</td></tr>"
+    h = h & "<tr><td>Customer Name</td><td>" & HE(p.CustName) & "</td></tr>"
+    h = h & "<tr><td>Account Number</td><td>" & HE(p.AcctNo) & "</td></tr>"
+    h = h & "<tr><td>Product</td><td>" & HE(p.BankProduct) & "</td></tr>"
+    h = h & "<tr><td>Tenor</td><td>" & HE(p.TenorCode) & "</td></tr>"
+    h = h & "<tr><td>RFI Date</td><td>" & HE(p.RFIDate) & "</td></tr>"
+    h = h & "</table>"
+    h = h & "<br>"
+
+    ' ---- RFI Queries Section --------------------------------
+    h = h & "<p><strong>RFI Queries:</strong></p>"
+    h = h & "<ol>"
+
+    Dim inwardGroups()  As String
+    Dim inwardAmts()    As Double
+    Dim inwardCount     As Long
+    Dim outwardGroups() As String
+    Dim outwardAmts()   As Double
+    Dim outwardCount    As Long
+
+    ComputeTransactionGroups txns, txnCount, _
+        inwardGroups, inwardAmts, inwardCount, _
+        outwardGroups, outwardAmts, outwardCount
+
+    ' Q1
+    h = h & "<li>Please provide the purpose of maintaining the above-mentioned bank account.</li>"
+
+    ' Q2
+    h = h & "<li>Please provide details on the source of funds credited to the account.</li>"
+
+    ' Q3 — Inward transfers: observation only, NO repeated supporting-document text
+    Dim i As Long
+    For i = 1 To inwardCount
+        h = h & "<li>Inward transfer of <strong>" & HE(FormatAmount(inwardAmts(i))) & _
+                "</strong> was received from <strong>" & HE(inwardGroups(i)) & "</strong>.</li>"
+    Next i
+
+    ' Q4 — Outward transfers: observation only, NO repeated supporting-document text
+    Dim j As Long
+    For j = 1 To outwardCount
+        h = h & "<li>Outward transfer of <strong>" & HE(FormatAmount(outwardAmts(j))) & _
+                "</strong> was made to <strong>" & HE(outwardGroups(j)) & "</strong>.</li>"
+    Next j
+
+    h = h & "</ol>"
+
+    ' v18: ONE consolidated note (if transactions exist)
+    If inwardCount > 0 Or outwardCount > 0 Then
+        h = h & "<p><em><strong>Note:</strong> For all the above transaction queries, kindly provide the "
+        h = h & "purpose and nature of the transactions along with the supporting documents.</em></p>"
+    Else
+        h = h & "<p>Please provide the purpose and nature of the transactions along with the supporting documents.</p>"
+    End If
+
+    ' ---- Branch Details Section (v18 new) -------------------
+    h = h & "<br>"
+    h = h & "<p><strong>Branch Details:</strong></p>"
+    h = h & "<p>" & HE(LookupBranch(p)) & "</p>"
+
+    ' ---- Closing -------------------------------------------
+    h = h & "<br>"
+    h = h & "<p>Kindly respond at your earliest convenience. Should you require any clarification, "
+    h = h & "please do not hesitate to contact us.</p>"
+    h = h & "<p>Thank you for your cooperation.</p>"
+    h = h & "<p>Regards,<br>Compliance / AML Team</p>"
+    h = h & "<p style=""font-size:9pt;color:#888;"">Generated by Auto RFI Narration Generator v" & APP_VERSION & "</p>"
+    h = h & "</body></html>"
+
+    BuildEmailHTML = h
+End Function
+
+' HTML Encode helper — escapes &, <, >, "
+Private Function HE(s As String) As String
+    Dim r As String
+    r = s
+    r = Replace(r, "&",  "&amp;")
+    r = Replace(r, "<",  "&lt;")
+    r = Replace(r, ">",  "&gt;")
+    r = Replace(r, """", "&quot;")
+    HE = r
+End Function
+
+' ============================================================
+' MAKE RESPONSE EMAIL
+' v18: Subject also uses [BLANK] for Case ID.
+' ============================================================
+Public Sub MakeResponseEmail(p As ParsedInfo)
+    On Error GoTo ErrHandler
+
+    Dim olApp  As Object
+    Dim olMail As Object
+
+    Set olApp  = CreateObject("Outlook.Application")
+    Set olMail = olApp.CreateItem(0)
+
+    ' v18: Case ID is [BLANK] in response email subject as well
+    Dim subject As String
+    subject = "RE: RFI - CASE ID - [BLANK] - CIF ID - " & p.CifID & _
+              " - " & p.CustName & " - " & p.BankProduct & " - " & p.TenorCode
+
+    olMail.Subject = subject
+
+    Dim html As String
+    html = "<!DOCTYPE html><html><body style=""font-family:Calibri,Arial,sans-serif;font-size:11pt;"">"
+    html = html & "<p>Dear Sir/Madam,</p>"
+    html = html & "<p>Thank you for your response to our RFI dated " & p.RFIDate & ".</p>"
+    html = html & "<p>We have reviewed the information provided and will revert to you should we require "
+    html = html & "any additional clarification.</p>"
+    html = html & "<p>Regards,<br>Compliance / AML Team</p>"
+    html = html & "<p style=""font-size:9pt;color:#888;"">Generated by Auto RFI Narration Generator v" & APP_VERSION & "</p>"
+    html = html & "</body></html>"
+
+    olMail.HTMLBody = html
+    olMail.Display
+
+    Set olMail = Nothing
+    Set olApp  = Nothing
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    Set olMail = Nothing
+    Set olApp  = Nothing
+    MsgBox "Failed to create response email: " & Err.Description, vbCritical, "RFI Generator v" & APP_VERSION
+End Sub
+
+' ============================================================
+' UNDERTAKING DOCUMENT GENERATOR
+' ============================================================
+Public Sub GenerateUndertaking(p As ParsedInfo)
+    On Error GoTo ErrHandler
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Dim wdSel As Object
+
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+    Set wdDoc = wdApp.Documents.Add
+    Set wdSel = wdApp.Selection
+
+    wdSel.HomeKey Unit:=6
+
+    AppendLine wdSel, "UNDERTAKING LETTER"
+    AppendLine wdSel, String(60, "-")
+    AppendLine wdSel, "Date         : " & p.RFIDate
+    AppendLine wdSel, "Case ID      : [BLANK]  (please fill manually)"
+    AppendLine wdSel, "CIF ID       : " & p.CifID
+    AppendLine wdSel, "Customer     : " & p.CustName
+    AppendLine wdSel, ""
+    AppendLine wdSel, "I/We, " & p.CustName & ", hereby undertake that the information provided in response"
+    AppendLine wdSel, "to the above-referenced RFI is true, complete and accurate to the best of my/our knowledge."
+    AppendLine wdSel, ""
+    AppendLine wdSel, "Signature : _______________________________"
+    AppendLine wdSel, "Date      : _______________________________"
+    AppendLine wdSel, ""
+    AppendLine wdSel, String(60, "-")
+    AppendLine wdSel, "Generated by Auto RFI Narration Generator v" & APP_VERSION
+
+    Dim savePath As String
+    Dim baseFolder As String
+    baseFolder = Left(p.DocPath, InStrRev(p.DocPath, Application.PathSeparator))
+    savePath = baseFolder & "Undertaking_" & p.CifID & "_" & Format(Now(), "YYYYMMDD_HHMMSS") & ".docx"
+
+    wdDoc.SaveAs2 Filename:=savePath, FileFormat:=16
+    wdDoc.Close
+    wdApp.Quit
+    Set wdSel = Nothing
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+
+    MsgBox "Undertaking saved: " & savePath, vbInformation, "RFI Generator v" & APP_VERSION
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    MsgBox "Failed to generate undertaking: " & Err.Description, vbCritical, "RFI Generator v" & APP_VERSION
+End Sub
+
+' ============================================================
+' PDF EXPORT
+' ============================================================
+Public Sub ExportToPDF(docPath As String)
+    On Error GoTo ErrHandler
+
+    If docPath = "" Or Dir(docPath) = "" Then
+        MsgBox "Document not found: " & docPath, vbExclamation, "PDF Export"
+        Exit Sub
+    End If
+
+    Dim wdApp As Object
+    Dim wdDoc As Object
+    Set wdApp = CreateObject("Word.Application")
+    wdApp.Visible = False
+    Set wdDoc = wdApp.Documents.Open(Filename:=docPath, ReadOnly:=True)
+
+    Dim pdfPath As String
+    Dim dotPos As Long
+    dotPos = InStrRev(docPath, ".")
+    If dotPos > 0 Then
+        pdfPath = Left(docPath, dotPos - 1) & ".pdf"
+    Else
+        pdfPath = docPath & ".pdf"
+    End If
+
+    ' wdExportFormatPDF = 17
+    wdDoc.ExportAsFixedFormat OutputFilename:=pdfPath, ExportFormat:=17
+
+    wdDoc.Close SaveChanges:=False
+    wdApp.Quit
+    Set wdDoc = Nothing
+    Set wdApp = Nothing
+
+    MsgBox "PDF exported: " & pdfPath, vbInformation, "RFI Generator v" & APP_VERSION
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    If Not wdDoc Is Nothing Then wdDoc.Close SaveChanges:=False
+    If Not wdApp Is Nothing Then wdApp.Quit
+    MsgBox "PDF export failed: " & Err.Description, vbCritical, "RFI Generator v" & APP_VERSION
+End Sub
+
+' ============================================================
+' ACTIVITY LOGGER
+' ============================================================
+Private Sub LogActivity(p As ParsedInfo, narrationPath As String)
+    On Error Resume Next
+
+    Dim logPath As String
+    Dim baseFolder As String
+    baseFolder = Left(p.DocPath, InStrRev(p.DocPath, Application.PathSeparator))
+    logPath = baseFolder & "RFI_Activity_Log.txt"
+
+    Dim fileNum As Integer
+    fileNum = FreeFile
+    Open logPath For Append As #fileNum
+    Print #fileNum, "[" & Format(Now(), "YYYY-MM-DD HH:MM:SS") & "]" & _
+                    "  v" & APP_VERSION & _
+                    "  CIF=" & p.CifID & _
+                    "  ACCT=" & p.AcctNo & _
+                    "  CASE=[BLANK]" & _
+                    "  FILE=" & narrationPath
+    Close #fileNum
+End Sub
+
+' ============================================================
+' UTILITY — VERSION INFO
+' ============================================================
+Public Sub ShowVersion()
+    MsgBox "Auto RFI Narration Generator" & vbCrLf & _
+           "Version : " & APP_VERSION & vbCrLf & _
+           "Date    : 2026-03-27" & vbCrLf & vbCrLf & _
+           "Key changes in v18.0:" & vbCrLf & _
+           "  1. Case ID left blank for manual entry" & vbCrLf & _
+           "  2. Subject: RFI - CASE ID - [BLANK] - CIF ID - ..." & vbCrLf & _
+           "  3. Attachments removed from email" & vbCrLf & _
+           "  4. Deduped repeated wording in Q3/Q4" & vbCrLf & _
+           "  5. Common note added for transaction queries" & vbCrLf & _
+           "  6. Branch Details section added" & vbCrLf & _
+           "  7. Branch lookup from first 3 digits of account number", _
+           vbInformation, "About RFI Generator"
+End Sub
